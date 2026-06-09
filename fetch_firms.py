@@ -21,11 +21,26 @@ import csv
 import io
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+
+# v2 — force IPv4 for all urllib requests. GitHub Actions runners
+# resolve firms.modaps.eosdis.nasa.gov to both A (198.118.194.34) and
+# AAAA (2001:4d0:241a:40c0::34); Python 3.12 urllib prefers AAAA but
+# the runner's IPv6 egress is broken/half-configured for that route,
+# so every connection raises [Errno 101] Network is unreachable.
+# Curl falls back to IPv4 automatically; urllib doesn't.
+# Verified: same runner instance, same DNS, curl --ipv4 returns 200,
+# urllib + default getaddrinfo throws errno 101.
+# Fix: drop AAAA records from getaddrinfo so urllib only ever sees A.
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_only_getaddrinfo(*args, **kwargs):
+    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
+socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 MAP_KEY = os.environ.get('FIRMS_MAP_KEY', '').strip()
 if not MAP_KEY:
