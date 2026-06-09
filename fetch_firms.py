@@ -31,13 +31,22 @@ MAP_KEY = os.environ.get('FIRMS_MAP_KEY', '').strip()
 if not MAP_KEY:
     sys.exit('FIRMS_MAP_KEY env var required; register at firms.modaps.eosdis.nasa.gov/api/map_key')
 
-# US-wide bbox covering CONUS + AK + HI + PR. Identical to the
-# index.html _USWIDE_ENVELOPE the frontend already trusts.
-US_BBOX = '-180,15,-65,72'   # minLon,minLat,maxLon,maxLat
+# US filter envelope (CONUS + AK + HI + PR). Applied client-side after
+# fetch — the FIRMS API supports a `<minLon,minLat,maxLon,maxLat>` URL
+# segment, BUT the literal commas in that path get silently re-encoded
+# by something in the GitHub Actions egress chain (proxy / WAF / http
+# library) to %2C, which FIRMS' router then rejects with HTTP 400
+# 'Invalid area.'  Local curl + local Python urllib both work fine.
+# Workaround: fetch the global feed (`world` keyword, ~155KB CSV) and
+# filter to this envelope client-side.  No commas in the URL path,
+# no encoding tax, sidesteps the GHA-egress mangling entirely.
+# Trade-off: 1 extra MAP_KEY transaction and ~150KB more bytes per
+# fetch — well under the 5000 tx / 10 min quota.
+US_FILTER = (-180.0, 15.0, -65.0, 72.0)   # min_lng, min_lat, max_lng, max_lat
 
-# Day range — FIRMS API takes 1-10 days back. 1 day matches the
-# MODIS_Thermal_v1 "48h" window we used to query (close enough; FIRMS
-# 1-day is rolling 24h from the run timestamp).
+# FIRMS area API day_range is 1-10 (verified 2026-06-09 against live
+# /api/area/csv endpoint with day=10 returning 200; older docs cap at
+# 5 — both seem accepted today; staying at 1 for cadence).
 DAYS = 1
 
 # Per FIRMS docs: VIIRS_SNPP_NRT (legacy S-NPP) + VIIRS_NOAA20_NRT
@@ -69,7 +78,8 @@ def fetch_source(source: str) -> list[dict]:
     on what looks like a perfectly valid URL (verified live via
     curl + Python urllib from non-GHA hosts), and the second attempt
     typically succeeds."""
-    url = f'{API_BASE}/{MAP_KEY}/{source}/{US_BBOX}/{DAYS}'
+    # `world` instead of bbox — see US_FILTER comment up top for why.
+    url = f'{API_BASE}/{MAP_KEY}/{source}/world/{DAYS}'
     headers = {'User-Agent': 'firestorm-firms-data/1.0',
                'Accept': 'text/csv,*/*'}
     last_err = None
@@ -83,8 +93,22 @@ def fetch_source(source: str) -> list[dict]:
             break   # success
         except urllib.error.HTTPError as e:
             last_err = e
-            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/3: HTTPError {e.code} for {source}: {e.reason}\n')
-            # 401/403 = real auth failure, don't retry
+            # CRITICAL — read the response body. FIRMS returns the actual
+            # error message in the 400 body ('Invalid MAP_KEY.', 'Invalid
+            # area.', 'Invalid day range.'). Without this, every failure
+            # mode looks identical and we burn rounds guessing.
+            try:
+                err_body = e.read().decode('utf-8', errors='replace')[:300]
+            except Exception:
+                err_body = '<no body>'
+            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/3: HTTPError {e.code} for {source}: {e.reason} | body={err_body!r}\n')
+            # Loud bail on the things that will never resolve via retry:
+            #   - Bad/expired/whitespace-padded MAP_KEY (FIRMS returns 400
+            #     'Invalid MAP_KEY.' — confusing because it's the same
+            #     status code as a transient 400, distinguished by body)
+            #   - 401/403 — explicit auth failure
+            if 'Invalid MAP_KEY' in err_body:
+                sys.exit(f'[fetch_source] FIRMS rejected MAP_KEY (env var len={len(MAP_KEY)}): {err_body.strip()[:120]}')
             if e.code in (401, 403):
                 return []
             continue
@@ -102,13 +126,17 @@ def fetch_source(source: str) -> list[dict]:
         sys.exit(f'[fetch_source] {source}: {body.strip()[:80]}')
 
     rows = []
+    min_lng, min_lat, max_lng, max_lat = US_FILTER
     for r in csv.DictReader(io.StringIO(body)):
         try:
             lat = float(r.get('latitude', ''))
             lng = float(r.get('longitude', ''))
         except (TypeError, ValueError):
             continue
-        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        # Client-side filter to the US envelope. The `world` URL returns
+        # the global FIRMS feed (~all continents); we want only CONUS +
+        # AK + HI + PR for the dashboard.
+        if not (min_lat <= lat <= max_lat and min_lng <= lng <= max_lng):
             continue
         # Normalize MODIS + VIIRS into the same shape. FRP and brightness
         # are common; bright_ti4/bright_ti5 are VIIRS-specific (the two
@@ -172,6 +200,19 @@ def write_json(path: str, payload: dict) -> None:
 def main() -> int:
     now_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     overall_failed = []
+
+    # Pre-flight: probe the MAP_KEY status endpoint. Surfaces (a) auth
+    # validity, (b) current_transactions vs transaction_limit (5000/10min),
+    # (c) the fact that the secret made it to the runner intact. Catches
+    # the silent "secret has trailing whitespace / is empty / never
+    # propagated" failure mode that v1 of this pipeline hit on GHA.
+    try:
+        status_url = f'https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY={MAP_KEY}'
+        with urllib.request.urlopen(status_url, timeout=15) as r:
+            status_body = r.read().decode('utf-8', errors='replace')
+        sys.stderr.write(f'[mapkey_status] (key_len={len(MAP_KEY)}) {status_body[:300]}\n')
+    except Exception as e:
+        sys.stderr.write(f'[mapkey_status] probe failed (key_len={len(MAP_KEY)}): {e}\n')
 
     for out_filename, sources in SOURCES.items():
         rows, failed = build_output(out_filename, sources)
