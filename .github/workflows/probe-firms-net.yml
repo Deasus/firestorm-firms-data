@@ -1,0 +1,23 @@
+name: probe-firms-net
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe DNS + connectivity to FIRMS
+        run: |
+          echo "=== secret length probe (no value, just length) ==="
+          echo "FIRMS_MAP_KEY length: ${#FIRMS_MAP_KEY}"
+          echo "=== DNS resolution ==="
+          getent ahosts firms.modaps.eosdis.nasa.gov || true
+          echo "=== IPv4 only ==="
+          getent ahostsv4 firms.modaps.eosdis.nasa.gov || true
+          echo "=== curl with verbose ==="
+          curl -sS -v --max-time 30 -w "\nHTTP_CODE=%{http_code}\n" \
+            "https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=$FIRMS_MAP_KEY" 2>&1 | head -40 || true
+          echo "=== curl --ipv4 ==="
+          curl -sS --ipv4 --max-time 30 -w "\nHTTP_CODE=%{http_code}\n" \
+            "https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=$FIRMS_MAP_KEY" 2>&1 | tail -10 || true
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
