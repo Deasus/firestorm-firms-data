@@ -63,20 +63,37 @@ HTTP_TIMEOUT = 60
 
 def fetch_source(source: str) -> list[dict]:
     """Pull one FIRMS source as CSV + parse into list[dict]. Returns
-    [] on transient failure; raises on misconfigured request."""
+    [] on transient failure; raises on misconfigured request.
+    Retries up to 3 times on transient errors (400/429/5xx) with
+    exponential backoff — FIRMS occasionally returns 400 Bad Request
+    on what looks like a perfectly valid URL (verified live via
+    curl + Python urllib from non-GHA hosts), and the second attempt
+    typically succeeds."""
     url = f'{API_BASE}/{MAP_KEY}/{source}/{US_BBOX}/{DAYS}'
-    req = urllib.request.Request(url, headers={'User-Agent': 'firestorm-firms-data/1.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            body = resp.read().decode('utf-8', errors='replace')
-    except urllib.error.HTTPError as e:
-        # 401 = bad MAP_KEY. 429 = rate limited. 5xx = transient. We
-        # don't want any of these to silently produce stale JSON, so
-        # bubble the failure up to the watchdog.
-        sys.stderr.write(f'[fetch_source] HTTPError {e.code} for {source}: {e.reason}\n')
-        return []
-    except urllib.error.URLError as e:
-        sys.stderr.write(f'[fetch_source] URLError for {source}: {e.reason}\n')
+    headers = {'User-Agent': 'firestorm-firms-data/1.0',
+               'Accept': 'text/csv,*/*'}
+    last_err = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2 ** attempt)   # 2s, 4s
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                body = resp.read().decode('utf-8', errors='replace')
+            break   # success
+        except urllib.error.HTTPError as e:
+            last_err = e
+            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/3: HTTPError {e.code} for {source}: {e.reason}\n')
+            # 401/403 = real auth failure, don't retry
+            if e.code in (401, 403):
+                return []
+            continue
+        except urllib.error.URLError as e:
+            last_err = e
+            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/3: URLError for {source}: {e.reason}\n')
+            continue
+    else:
+        sys.stderr.write(f'[fetch_source] all retries exhausted for {source}; giving up\n')
         return []
 
     # FIRMS API returns text "Invalid MAP_KEY." literally on 200 with
@@ -143,6 +160,9 @@ def build_output(out_filename: str, sources: list[str]) -> tuple[list[dict], lis
 
 
 def write_json(path: str, payload: dict) -> None:
+    # Ensure parent dir exists (data/ doesn't get tracked by git when empty,
+    # so a fresh runner clone won't have it).
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(payload, f, separators=(',', ':'))
