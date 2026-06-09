@@ -63,7 +63,21 @@ jobs:
             echo "no changes — skipping commit"
           else
             git commit -m "auto-update firms.json + viirs.json + health.json"
-            git push
+            # Race-safe push: 4 attempts. Concurrent runs of this same workflow
+            # (15-min cron + self-redispatch + push triggers) can land on
+            # origin between the runner's checkout and its push, causing
+            # 'fetch first' rejection. Rebase onto the remote and retry.
+            for attempt in 1 2 3 4; do
+              if git push 2>&1; then
+                echo "push succeeded on attempt $attempt"
+                exit 0
+              fi
+              echo "push attempt $attempt rejected — fetching + rebasing"
+              git fetch origin main
+              git rebase origin/main || { git rebase --abort; sleep 5; }
+            done
+            echo "::error::push failed after 4 attempts"
+            exit 1
           fi
 
       - name: self-redispatch
