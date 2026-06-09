@@ -1,0 +1,76 @@
+name: update-firms
+
+# Self-redispatching loop pattern (matches firestorm-lightning-data /
+# firestorm-ngfs-data / firestorm-goes-fire-data). Cron is the
+# dead-man restart; the in-run loop fires fetch every ~3 min for
+# ~12 min and then re-dispatches itself, sidestepping GHA's
+# schedule-throttling on hot repos.
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 min as the dead-man fallback
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'fetch_firms.py'
+      - '.github/workflows/update-firms.yml'
+
+permissions:
+  contents: write
+  actions: write   # needed for self-redispatch via gh workflow run
+
+concurrency:
+  group: update-firms
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: fetch FIRMS + VIIRS in a loop (4 cycles, ~3 min apart)
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+        run: |
+          set -e
+          if [ -z "$FIRMS_MAP_KEY" ]; then
+            echo "::error::FIRMS_MAP_KEY secret not set on repo"
+            exit 1
+          fi
+          for cycle in 1 2 3 4; do
+            echo "::group::cycle $cycle"
+            python3 fetch_firms.py
+            echo "::endgroup::"
+            if [ "$cycle" -lt 4 ]; then
+              sleep 180
+            fi
+          done
+
+      - name: commit + push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add data/
+          if git diff --cached --quiet; then
+            echo "no changes — skipping commit"
+          else
+            git commit -m "auto-update firms.json + viirs.json + health.json"
+            git push
+          fi
+
+      - name: self-redispatch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Re-fire ourselves so the next run kicks off in ~3 min instead
+          # of waiting for the */15 schedule. Schedule cron stays as the
+          # dead-man restart in case a self-redispatch is dropped.
+          gh workflow run update-firms.yml --ref main || true
