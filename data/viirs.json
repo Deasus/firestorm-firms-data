@@ -1,1 +1,1 @@
-{"generated_utc":"2026-07-02T03:39:51.853492Z","window_hours":24,"envelope":{"min_lng":-180,"min_lat":15,"max_lng":-65,"max_lat":72},"sources":["VIIRS_SNPP_NRT","VIIRS_NOAA20_NRT"],"sources_failed_this_run":["VIIRS_SNPP_NRT","VIIRS_NOAA20_NRT"],"count":0,"detections":[]}
+{"generated_utc":"2026-07-02T03:49:10.231995Z","window_hours":24,"envelope":{"min_lng":-180,"min_lat":15,"max_lng":-65,"max_lat":72},"sources":["VIIRS_SNPP_NRT","VIIRS_NOAA20_NRT"],"sources_failed_this_run":["VIIRS_SNPP_NRT","VIIRS_NOAA20_NRT"],"count":0,"detections":[]}
