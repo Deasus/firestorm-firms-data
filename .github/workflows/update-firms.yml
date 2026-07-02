@@ -72,15 +72,24 @@ jobs:
             # Race-safe push: 4 attempts. Concurrent runs of this same workflow
             # (15-min cron + self-redispatch + push triggers) can land on
             # origin between the runner's checkout and its push, causing
-            # 'fetch first' rejection. Rebase onto the remote and retry.
+            # 'fetch first' rejection.
+            #
+            # Data-file merge conflict resolution: our JSONs (firms.json /
+            # viirs.json / health.json) are always regenerated wholesale — any
+            # conflict is a race, not a semantic disagreement. In a race the
+            # NEWER commit wins (our new data is fresher than theirs was).
+            # We resolve with `-X ours` which takes OUR version when a conflict
+            # arises during rebase. Verified 2026-07-02 after v2_331 pushed
+            # (self-mine adaptive tune) and two pipelines raced, causing 4
+            # rejected pushes over 4 attempts.
             for attempt in 1 2 3 4; do
               if git push 2>&1; then
                 echo "push succeeded on attempt $attempt"
                 exit 0
               fi
-              echo "push attempt $attempt rejected — fetching + rebasing"
+              echo "push attempt $attempt rejected — fetching + rebasing (ours-preferred)"
               git fetch origin main
-              git rebase origin/main || { git rebase --abort; sleep 5; }
+              git rebase -X ours origin/main || { git rebase --abort; sleep 5; }
             done
             echo "::error::push failed after 4 attempts"
             exit 1
