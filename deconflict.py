@@ -217,15 +217,24 @@ class Deconflicter:
                         else:
                             out['deconfliction_flag'] = 'proximate_' + str(cls)
 
-        # Offshore test (only apply if the detection isn't already flagged as
-        # near a known industrial/volcano source — those subsume it)
-        if self.has_land and out['deconfliction_flag'] in ('clear', 'low_confidence'):
-            if not self._is_on_land(lat, lng):
-                # An offshore hit near a known industrial source (offshore
-                # flare platform) would already be flagged above; anything
-                # remaining offshore + not-flagged is sun-glint / ship /
-                # unregistered platform — call it offshore.
-                out['deconfliction_flag'] = 'offshore' if out['deconfliction_flag'] == 'clear' else out['deconfliction_flag']
+        # v2 — OFFSHORE flagging DISABLED (was: point-in-Natural-Earth-10m-land).
+        # Rationale: Natural Earth 10m is a 1:10M-scale generalized coastline.
+        # VIIRS 375m native pixel + ~125m FIRMS geolocation error means a
+        # LEGITIMATE coastal wildfire commonly plots outside the simplified
+        # polygon — a false-positive-false-positive. Operator screenshot
+        # 2026-07-02 showed CONUS-wide offshore mis-flagging (St. Louis,
+        # Chicago, Nashville, Birmingham all tagged offshore).
+        #
+        # The right fix is a distance-INTO-water threshold (require ≥2km
+        # from any land polygon before flagging), but that needs a proper
+        # spatial index against the polygon boundary distance which we
+        # haven't built. Until then: keep the industrial / volcano /
+        # nuclear / low_confidence flags (accurate + operator-actionable)
+        # and skip offshore entirely.
+        #
+        # NOTE: has_land / _walk_geometry / _is_on_land are still loaded
+        # so we can re-enable in v2 with the distance-threshold fix. No
+        # code deletion — just don't emit the flag.
 
         return out
 
