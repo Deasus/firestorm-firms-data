@@ -45,11 +45,17 @@ jobs:
             echo "::error::FIRMS_MAP_KEY secret not set on repo"
             exit 1
           fi
-          for cycle in 1 2 3 4; do
+          # Reduced 4→2 cycles 2026-07-02: after adding the deconflict layer
+          # (7MB land polygon fetch + 11k-source BallTree build per Python
+          # invocation, since the process is fresh each cycle), 4 cycles of
+          # ~90-180s regularly overran the 15-min workflow timeout and every
+          # run got cancelled with STALE data left on origin. 2 cycles is
+          # still faster than the 15-min cron cadence and keeps cadence honest.
+          for cycle in 1 2; do
             echo "::group::cycle $cycle"
             python3 fetch_firms.py
             echo "::endgroup::"
-            if [ "$cycle" -lt 4 ]; then
+            if [ "$cycle" -lt 2 ]; then
               sleep 180
             fi
           done
