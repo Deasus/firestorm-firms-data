@@ -134,17 +134,27 @@ class Deconflicter:
         land_fc = _http_json(LAND_POLY_URL)
         if land_fc and isinstance(land_fc.get('features'), list):
             for f in land_fc['features']:
-                geom = f.get('geometry') or {}
-                t = geom.get('type')
-                if t == 'Polygon':
-                    self._add_polygon(geom.get('coordinates') or [])
-                elif t == 'MultiPolygon':
-                    for poly in geom.get('coordinates') or []:
-                        self._add_polygon(poly)
+                self._walk_geometry(f.get('geometry') or {})
             self.has_land = bool(self._land_polys)
             sys.stderr.write(f'[deconflict] indexed {len(self._land_polys)} land polygons\n')
 
         self.loaded = True
+
+    def _walk_geometry(self, geom: dict) -> None:
+        """Recursively unwrap a GeoJSON geometry (Polygon / MultiPolygon /
+        GeometryCollection) into flat Polygon rings. Natural Earth ships some
+        land features as GeometryCollection (e.g., Antarctica), so we must
+        recurse — the v0.1 flat-type-switch silently skipped all 11 features."""
+        if not geom: return
+        t = geom.get('type')
+        if t == 'Polygon':
+            self._add_polygon(geom.get('coordinates') or [])
+        elif t == 'MultiPolygon':
+            for poly in geom.get('coordinates') or []:
+                self._add_polygon(poly)
+        elif t == 'GeometryCollection':
+            for g in geom.get('geometries') or []:
+                self._walk_geometry(g)
 
     def _add_polygon(self, coords: list) -> None:
         """Store polygon + bbox for fast pre-filtering."""
