@@ -28,6 +28,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
+from deconflict import Deconflicter   # v2_deconflict-mvp — spatial join against firestorm-industrial-sites
+
 # v2 — force IPv4 for all urllib requests. GitHub Actions runners
 # resolve firms.modaps.eosdis.nasa.gov to both A (198.118.194.34) and
 # AAAA (2001:4d0:241a:40c0::34); Python 3.12 urllib prefers AAAA but
@@ -83,6 +85,19 @@ US_RECORD_HARD_CAP = {
 
 API_BASE = 'https://firms.modaps.eosdis.nasa.gov/api/area/csv'
 HTTP_TIMEOUT = 60
+
+# v2_deconflict-mvp — module-level singleton, populated on first use.
+# Load-once at pipeline start: the industrial_sites layer is a slow-moving
+# reference (~weekly refresh upstream). Every detection then gets enriched
+# without re-fetching the ~200 KB reference file per source.
+_DECONFLICTER: Deconflicter | None = None
+
+def _get_deconflicter() -> Deconflicter:
+    global _DECONFLICTER
+    if _DECONFLICTER is None:
+        _DECONFLICTER = Deconflicter()
+        _DECONFLICTER.load()   # NEVER raises — best-effort by design
+    return _DECONFLICTER
 
 
 def fetch_source(source: str) -> list[dict]:
@@ -167,7 +182,7 @@ def fetch_source(source: str) -> list[dict]:
             frp = float(r.get('frp')) if r.get('frp') else None
         except ValueError:
             frp = None
-        rows.append({
+        det = {
             'lat': round(lat, 4),
             'lng': round(lng, 4),
             'brightness_k': bright_k,
@@ -178,7 +193,17 @@ def fetch_source(source: str) -> list[dict]:
             'satellite': r.get('satellite') or source.replace('_NRT', '').replace('_SP', ''),
             'sensor': 'MODIS' if 'MODIS' in source else 'VIIRS',
             'daynight': r.get('daynight') or None,
-        })
+        }
+        # v2_deconflict-mvp — inline enrichment. Adds nearest_infra_m,
+        # nearest_infra_id, nearest_infra_class, nearest_infra_name,
+        # deconfliction_flag. Never raises — falls through to
+        # {flag='clear'} on any error.
+        try:
+            det.update(_get_deconflicter().enrich(det))
+        except Exception as _e:
+            sys.stderr.write(f'[deconflict] enrichment failed on one row: {_e}\n')
+            det.setdefault('deconfliction_flag', 'clear')
+        rows.append(det)
     return rows
 
 
@@ -232,6 +257,18 @@ def main() -> int:
     for out_filename, sources in SOURCES.items():
         rows, failed = build_output(out_filename, sources)
         overall_failed.extend(failed)
+        # v2_deconflict-mvp — per-run deconfliction summary. Operators/devs
+        # can watch the "flagged vs clear" ratio on the GHA run summary +
+        # in the output JSON itself. Frontend reads this to render the
+        # header chip row (FIRE ANOMALIES / DECONFLICTED / INDUSTRIAL / ...).
+        flag_counts: dict[str, int] = {}
+        for det in rows:
+            flag_counts[det.get('deconfliction_flag') or 'clear'] = \
+                flag_counts.get(det.get('deconfliction_flag') or 'clear', 0) + 1
+        clear_n = flag_counts.get('clear', 0)
+        pct_clear = (100.0 * clear_n / len(rows)) if rows else 0.0
+        sys.stderr.write(f'[deconflict] {out_filename}: {clear_n}/{len(rows)} clear ({pct_clear:.0f}%) | flags={flag_counts}\n')
+
         out_path = os.path.join('data', out_filename)
         write_json(out_path, {
             'generated_utc': now_iso,
@@ -240,6 +277,12 @@ def main() -> int:
             'sources': sources,
             'sources_failed_this_run': failed,
             'count': len(rows),
+            'deconfliction_counts': flag_counts,
+            'deconfliction_meta': {
+                'reference_layer_loaded': (_DECONFLICTER.loaded if _DECONFLICTER else False),
+                'n_sources':              (_DECONFLICTER.n_sources if _DECONFLICTER else 0),
+                'has_land_polygon':       (_DECONFLICTER.has_land if _DECONFLICTER else False),
+            },
             'detections': rows,
         })
         sys.stderr.write(f'[write] {out_path}: {len(rows)} rows\n')
