@@ -182,8 +182,20 @@ class Deconflicter:
         # Confidence-low is authoritative regardless of proximity — NASA says
         # dropping confidence=low kills ~80% of false positives. We flag but
         # do not drop (life-safety default: never suppress silently).
-        conf = (det.get('confidence') or '').strip().lower()
-        if conf == 'low':
+        #
+        # VIIRS emits single-letter codes ('l'/'n'/'h') NOT the full words
+        # ('low'/'nominal'/'high'). MODIS emits 0-100 integers. Handle all
+        # three shapes. Bug caught 2026-07-02 operator UAT: my initial
+        # `conf == 'low'` string check missed 1,529 confidence='l' rows
+        # (~6% of the feed) — those rows were silently marked 'clear'
+        # despite being NASA's own drop-these signal.
+        conf_raw = det.get('confidence')
+        conf_str = str(conf_raw).strip().lower() if conf_raw is not None else ''
+        is_low = (
+            conf_str in ('l', 'low')
+            or (conf_str.isdigit() and int(conf_str) < 30)   # MODIS numeric: <30 = low
+        )
+        if is_low:
             out['deconfliction_flag'] = 'low_confidence'
 
         lat = det.get('lat')
