@@ -103,19 +103,29 @@ def _get_deconflicter() -> Deconflicter:
 def fetch_source(source: str) -> list[dict]:
     """Pull one FIRMS source as CSV + parse into list[dict]. Returns
     [] on transient failure; raises on misconfigured request.
-    Retries up to 3 times on transient errors (400/429/5xx) with
-    exponential backoff — FIRMS occasionally returns 400 Bad Request
-    on what looks like a perfectly valid URL (verified live via
-    curl + Python urllib from non-GHA hosts), and the second attempt
-    typically succeeds."""
+
+    v2_348l — retry ladder extended from 3 to 5 attempts with longer
+    URLError backoff (2s, 4s, 8s, 16s) after operators reported
+    email-alert noise 2026-07-17 driven by NASA FIRMS API transient
+    timeouts on VIIRS_SNPP_NRT + VIIRS_NOAA20_NRT. Log inspection
+    showed the failing runs saw the same URL timeout on all 3
+    attempts within a ~2-minute window; a 5th attempt at t+30s often
+    succeeds once NASA's server settles.
+    """
     # `world` instead of bbox — see US_FILTER comment up top for why.
     url = f'{API_BASE}/{MAP_KEY}/{source}/world/{DAYS}'
     headers = {'User-Agent': 'firestorm-firms-data/1.0',
                'Accept': 'text/csv,*/*'}
     last_err = None
-    for attempt in range(3):
+    MAX_ATTEMPTS = 5
+    for attempt in range(MAX_ATTEMPTS):
         if attempt:
-            time.sleep(2 ** attempt)   # 2s, 4s
+            # v2_348l — exponential backoff, cap at 16s. Total worst-case
+            # per source across 5 attempts: 2+4+8+16 = 30s of backoff plus
+            # 5×60s HTTP timeouts = ~5.5 min. Fits within the 15-min
+            # workflow timeout for BOTH cycles even if all sources go
+            # bad simultaneously.
+            time.sleep(min(2 ** attempt, 16))
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
@@ -131,7 +141,7 @@ def fetch_source(source: str) -> list[dict]:
                 err_body = e.read().decode('utf-8', errors='replace')[:300]
             except Exception:
                 err_body = '<no body>'
-            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/3: HTTPError {e.code} for {source}: {e.reason} | body={err_body!r}\n')
+            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/{MAX_ATTEMPTS}: HTTPError {e.code} for {source}: {e.reason} | body={err_body!r}\n')
             # Loud bail on the things that will never resolve via retry:
             #   - Bad/expired/whitespace-padded MAP_KEY (FIRMS returns 400
             #     'Invalid MAP_KEY.' — confusing because it's the same
@@ -144,7 +154,7 @@ def fetch_source(source: str) -> list[dict]:
             continue
         except urllib.error.URLError as e:
             last_err = e
-            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/3: URLError for {source}: {e.reason}\n')
+            sys.stderr.write(f'[fetch_source] attempt {attempt+1}/{MAX_ATTEMPTS}: URLError for {source}: {e.reason}\n')
             continue
     else:
         sys.stderr.write(f'[fetch_source] all retries exhausted for {source}; giving up\n')
@@ -318,7 +328,27 @@ def main() -> int:
     write_json(health_path, health)
     sys.stderr.write(f'[health] consecutive_failures={health["consecutive_failures"]} status={health["status"]}\n')
 
-    return 1 if all_failed else 0
+    # v2_348l — exit-code threshold on consecutive_failures, not per-run
+    # all_failed. Operators reported email-alert noise 2026-07-17: NASA
+    # FIRMS transient timeouts cause single-run failures ~13% of the time,
+    # but GHA emails on every non-zero exit code. Under the old return
+    # rule that was 6-10 emails/day for what was really just NASA hiccuping
+    # for one cycle. New rule: exit 1 only when consecutive_failures >= 3
+    # (roughly 45 min of continuous failure at our 15-min cron — the same
+    # threshold at which health.status flips to 'flaky' via >=1, 'degraded'
+    # via >=4). Within-threshold failures still write health.json so the
+    # firestorm-health tool + operator dashboard can surface the flap, and
+    # they still leave [health] logs in the GHA UI for anyone reading the
+    # run details — they just don't page.
+    ALERT_THRESHOLD = 3
+    should_alert = health['consecutive_failures'] >= ALERT_THRESHOLD
+    if all_failed and not should_alert:
+        sys.stderr.write(
+            f'[exit] all_failed=true but consecutive_failures={health["consecutive_failures"]} '
+            f'< {ALERT_THRESHOLD} threshold — exiting 0 to suppress single-hiccup alert '
+            f'(health.json still records the flap)\n'
+        )
+    return 1 if should_alert else 0
 
 
 if __name__ == '__main__':
