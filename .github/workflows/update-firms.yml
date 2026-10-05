@@ -26,11 +26,21 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      # 2026-10-05 — queue the NEXT run FIRST. The concurrency group holds it until this run
+      # finishes, so a slow, failed or cancelled run can no longer break the chain. Before, the
+      # re-dispatch was the LAST step: on 2026-10-05 the runs at 11:56Z and 14:17Z hit the
+      # 15-min timeout (NASA timing out from GitHub's runners), never reached it, and FIRMS
+      # stopped until GitHub's throttled schedule fired hours later.
+      - name: queue the next run (first, so this run cannot break the chain)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run update-firms.yml --ref main || echo "::warning::re-dispatch failed; the schedule will restart the chain"
 
       - uses: actions/setup-python@v5
         with:
@@ -94,12 +104,3 @@ jobs:
             echo "::error::push failed after 4 attempts"
             exit 1
           fi
-
-      - name: self-redispatch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Re-fire ourselves so the next run kicks off in ~3 min instead
-          # of waiting for the */15 schedule. Schedule cron stays as the
-          # dead-man restart in case a self-redispatch is dropped.
-          gh workflow run update-firms.yml --ref main || true

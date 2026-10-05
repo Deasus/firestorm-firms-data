@@ -84,7 +84,11 @@ US_RECORD_HARD_CAP = {
 }
 
 API_BASE = 'https://firms.modaps.eosdis.nasa.gov/api/area/csv'
-HTTP_TIMEOUT = 60
+# 2026-10-05: 60 s x 5 attempts per source (~5.5 min) x 3 sources overran the 15-min job
+# timeout whenever NASA timed out from GitHub's runners. Each cancelled run also broke the
+# self-dispatch chain. With carry-forward (below) a failed cycle costs nothing, so fail fast
+# and let the next cycle (~3 min later) retry.
+HTTP_TIMEOUT = 30
 
 # v2_deconflict-mvp — module-level singleton, populated on first use.
 # Load-once at pipeline start: the industrial_sites layer is a slow-moving
@@ -117,7 +121,7 @@ def fetch_source(source: str) -> list[dict]:
     headers = {'User-Agent': 'firestorm-firms-data/1.0',
                'Accept': 'text/csv,*/*'}
     last_err = None
-    MAX_ATTEMPTS = 5
+    MAX_ATTEMPTS = 4   # 4 x 30 s + 2+4+8 s backoff = ~2.2 min per source, worst case
     for attempt in range(MAX_ATTEMPTS):
         if attempt:
             # v2_348l — exponential backoff, cap at 16s. Total worst-case
@@ -150,7 +154,7 @@ def fetch_source(source: str) -> list[dict]:
             if 'Invalid MAP_KEY' in err_body:
                 sys.exit(f'[fetch_source] FIRMS rejected MAP_KEY (env var len={len(MAP_KEY)}): {err_body.strip()[:120]}')
             if e.code in (401, 403):
-                return []
+                return None
             continue
         except urllib.error.URLError as e:
             last_err = e
@@ -158,7 +162,7 @@ def fetch_source(source: str) -> list[dict]:
             continue
     else:
         sys.stderr.write(f'[fetch_source] all retries exhausted for {source}; giving up\n')
-        return []
+        return None   # None = FAILED; [] = the source genuinely had no detections
 
     # FIRMS API returns text "Invalid MAP_KEY." literally on 200 with
     # bad key — guard against that.
@@ -202,6 +206,7 @@ def fetch_source(source: str) -> list[dict]:
             'acq_time': r.get('acq_time') or None,
             'satellite': r.get('satellite') or source.replace('_NRT', '').replace('_SP', ''),
             'sensor': 'MODIS' if 'MODIS' in source else 'VIIRS',
+            'src': source,   # which FIRMS source produced the row: lets a failed source carry forward
             'daynight': r.get('daynight') or None,
         }
         # v2_deconflict-mvp — inline enrichment. Adds nearest_infra_m,
@@ -225,7 +230,7 @@ def build_output(out_filename: str, sources: list[str]) -> tuple[list[dict], lis
     for src in sources:
         sys.stderr.write(f'[fetch] {src} ...\n')
         rows = fetch_source(src)
-        if not rows:
+        if rows is None:
             failed.append(src)
             continue
         sys.stderr.write(f'[fetch] {src}: {len(rows)} rows\n')
@@ -247,6 +252,43 @@ def write_json(path: str, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+# 2026-10-05 — NEVER publish a thinner file because NASA timed out. Before this, a timeout
+# wrote "0 rows" (only a job cancellation kept it off Prod), and one failed VIIRS satellite
+# silently halved viirs.json. Now a source that fails keeps its rows from the previous file,
+# trimmed to the 24 h window, and if EVERY source for a file fails the previous file is left
+# untouched, so its generated_utc keeps showing its real age.
+_SAT_TO_SRC = {'N': 'VIIRS_SNPP_NRT', 'N20': 'VIIRS_NOAA20_NRT',
+               'A': 'MODIS_NRT', 'T': 'MODIS_NRT', 'Aqua': 'MODIS_NRT', 'Terra': 'MODIS_NRT'}
+
+
+def _previous(path: str) -> dict | None:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _carry_forward(prev: dict | None, src: str, now: datetime) -> list[dict]:
+    """The previous file's rows for one source that are still inside the window."""
+    if not prev:
+        return []
+    keep = []
+    for r in prev.get('detections', []):
+        if (r.get('src') or _SAT_TO_SRC.get(r.get('satellite'))) != src:
+            continue
+        try:
+            t = datetime.strptime(f"{r.get('acq_date')} {int(r.get('acq_time') or 0):04d}",
+                                  '%Y-%m-%d %H%M').replace(tzinfo=timezone.utc)
+            if (now - t).total_seconds() > DAYS * 86400 + 3 * 3600:
+                continue
+        except (TypeError, ValueError):
+            pass
+        r.setdefault('src', src)
+        keep.append(r)
+    return keep
+
+
 def main() -> int:
     now_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     overall_failed = []
@@ -264,9 +306,29 @@ def main() -> int:
     except Exception as e:
         sys.stderr.write(f'[mapkey_status] probe failed (key_len={len(MAP_KEY)}): {e}\n')
 
+    now_dt = datetime.now(timezone.utc)
     for out_filename, sources in SOURCES.items():
+        out_path = os.path.join('data', out_filename)
+        prev = _previous(out_path)
         rows, failed = build_output(out_filename, sources)
         overall_failed.extend(failed)
+        if failed and len(failed) == len(sources) and prev:
+            sys.stderr.write(f'[keep] {out_path}: every source failed this run; previous file left as is '
+                             f'({prev.get("count")} rows from {prev.get("generated_utc")})\n')
+            continue
+        carried = {}
+        for src in failed:
+            old = _carry_forward(prev, src, now_dt)
+            if old:
+                rows.extend(old)
+                carried[src] = len(old)
+                sys.stderr.write(f'[carry] {out_path}: {src} failed; kept {len(old)} rows from the previous file\n')
+        src_times = dict((prev or {}).get('source_generated_utc') or {})
+        for src in sources:
+            if src not in failed:
+                src_times[src] = now_iso
+            else:
+                src_times.setdefault(src, (prev or {}).get('generated_utc'))
         # v2_deconflict-mvp — per-run deconfliction summary. Operators/devs
         # can watch the "flagged vs clear" ratio on the GHA run summary +
         # in the output JSON itself. Frontend reads this to render the
@@ -279,13 +341,14 @@ def main() -> int:
         pct_clear = (100.0 * clear_n / len(rows)) if rows else 0.0
         sys.stderr.write(f'[deconflict] {out_filename}: {clear_n}/{len(rows)} clear ({pct_clear:.0f}%) | flags={flag_counts}\n')
 
-        out_path = os.path.join('data', out_filename)
         write_json(out_path, {
             'generated_utc': now_iso,
             'window_hours': DAYS * 24,
             'envelope': {'min_lng': -180, 'min_lat': 15, 'max_lng': -65, 'max_lat': 72},
             'sources': sources,
             'sources_failed_this_run': failed,
+            'sources_carried_forward': carried,        # {source: rows kept from the previous file}
+            'source_generated_utc': src_times,         # when each source last fetched successfully
             'count': len(rows),
             'deconfliction_counts': flag_counts,
             'deconfliction_meta': {
