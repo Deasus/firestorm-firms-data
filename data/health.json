@@ -1,1 +1,1 @@
-{"consecutive_failures":2,"last_success_utc":"2026-10-14T23:51:40.579631Z","status":"flaky","last_run_utc":"2026-10-15T00:07:08.915443Z","last_run_failed_sources":["MODIS_NRT","VIIRS_SNPP_NRT","VIIRS_NOAA20_NRT"]}
+{"consecutive_failures":0,"last_success_utc":"2026-10-15T00:20:30.896881Z","status":"ok","last_run_utc":"2026-10-15T00:20:30.896881Z","last_run_failed_sources":[]}
