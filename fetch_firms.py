@@ -29,6 +29,7 @@ import urllib.error
 from datetime import datetime, timezone
 
 from deconflict import Deconflicter   # v2_deconflict-mvp — spatial join against firestorm-industrial-sites
+import global_out                     # 2026-10-16 — global per-region outputs (data/global/)
 
 # v2 — force IPv4 for all urllib requests. GitHub Actions runners
 # resolve firms.modaps.eosdis.nasa.gov to both A (198.118.194.34) and
@@ -45,7 +46,16 @@ def _ipv4_only_getaddrinfo(*args, **kwargs):
 socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 MAP_KEY = os.environ.get('FIRMS_MAP_KEY', '').strip()
-if not MAP_KEY:
+# 2026-10-16 — local/dev only: with FIRMS_PUBLIC_FALLBACK=1 and no key, read NASA's public
+# keyless 24 h global files instead of the area API. Production always has the key.
+PUBLIC_FALLBACK = os.environ.get('FIRMS_PUBLIC_FALLBACK') == '1'
+PUBLIC_FILES = {
+    'VIIRS_SNPP_NRT':   'https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Global_24h.csv',
+    'VIIRS_NOAA20_NRT': 'https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Global_24h.csv',
+    'VIIRS_NOAA21_NRT': 'https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-21-viirs-c2/csv/J2_VIIRS_C2_Global_24h.csv',
+    'MODIS_NRT':        'https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Global_24h.csv',
+}
+if not MAP_KEY and not PUBLIC_FALLBACK:
     sys.exit('FIRMS_MAP_KEY env var required; register at firms.modaps.eosdis.nasa.gov/api/map_key')
 
 # US filter envelope (CONUS + AK + HI + PR). Applied client-side after
@@ -72,7 +82,7 @@ DAYS = 1
 # combined in a single feed.
 SOURCES = {
     'firms.json': ['MODIS_NRT'],                                    # MODIS Aqua + Terra
-    'viirs.json': ['VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT'],           # S-NPP + NOAA-20
+    'viirs.json': ['VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT'],   # S-NPP + NOAA-20 + NOAA-21 (2026-10-16)
 }
 
 # Hard ceilings. FIRMS API doesn't paginate but rate-limits at ~5000
@@ -117,7 +127,7 @@ def fetch_source(source: str) -> list[dict]:
     succeeds once NASA's server settles.
     """
     # `world` instead of bbox — see US_FILTER comment up top for why.
-    url = f'{API_BASE}/{MAP_KEY}/{source}/world/{DAYS}'
+    url = f'{API_BASE}/{MAP_KEY}/{source}/world/{DAYS}' if MAP_KEY else PUBLIC_FILES[source]
     headers = {'User-Agent': 'firestorm-firms-data/1.0',
                'Accept': 'text/csv,*/*'}
     last_err = None
@@ -170,18 +180,15 @@ def fetch_source(source: str) -> list[dict]:
         sys.exit(f'[fetch_source] {source}: {body.strip()[:80]}')
 
     rows = []
-    min_lng, min_lat, max_lng, max_lat = US_FILTER
     for r in csv.DictReader(io.StringIO(body)):
         try:
             lat = float(r.get('latitude', ''))
             lng = float(r.get('longitude', ''))
         except (TypeError, ValueError):
             continue
-        # Client-side filter to the US envelope. The `world` URL returns
-        # the global FIRMS feed (~all continents); we want only CONUS +
-        # AK + HI + PR for the dashboard.
-        if not (min_lat <= lat <= max_lat and min_lng <= lng <= max_lng):
-            continue
+        # 2026-10-16 — no US filter here any more: every row is kept for the
+        # global outputs; the US envelope is applied in main() for firms.json /
+        # viirs.json, which stay byte-compatible with what the client reads.
         # Normalize MODIS + VIIRS into the same shape. FRP and brightness
         # are common; bright_ti4/bright_ti5 are VIIRS-specific (the two
         # thermal bands), brightness/bright_t31 are MODIS-specific. We
@@ -209,16 +216,15 @@ def fetch_source(source: str) -> list[dict]:
             'src': source,   # which FIRMS source produced the row: lets a failed source carry forward
             'daynight': r.get('daynight') or None,
         }
-        # v2_deconflict-mvp — inline enrichment. Adds nearest_infra_m,
-        # nearest_infra_id, nearest_infra_class, nearest_infra_name,
-        # deconfliction_flag. Never raises — falls through to
-        # {flag='clear'} on any error.
-        try:
-            det.update(_get_deconflicter().enrich(det))
-        except Exception as _e:
-            sys.stderr.write(f'[deconflict] enrichment failed on one row: {_e}\n')
-            det.setdefault('deconfliction_flag', 'clear')
         rows.append(det)
+    # v2_deconflict-mvp enrichment, batched (2026-10-16): one BallTree query for the
+    # whole global source instead of one per row. Never raises.
+    try:
+        _get_deconflicter().enrich_many(rows)
+    except Exception as _e:
+        sys.stderr.write(f'[deconflict] batch enrichment failed: {_e}\n')
+        for det in rows:
+            det.setdefault('deconfliction_flag', 'clear')
     return rows
 
 
@@ -235,10 +241,6 @@ def build_output(out_filename: str, sources: list[str]) -> tuple[list[dict], lis
             continue
         sys.stderr.write(f'[fetch] {src}: {len(rows)} rows\n')
         combined.extend(rows)
-    cap = US_RECORD_HARD_CAP.get(out_filename, 100_000)
-    if len(combined) > cap:
-        sys.stderr.write(f'[cap] {out_filename}: {len(combined)} > {cap}, truncating\n')
-        combined = combined[:cap]
     return combined, failed
 
 
@@ -257,7 +259,7 @@ def write_json(path: str, payload: dict) -> None:
 # silently halved viirs.json. Now a source that fails keeps its rows from the previous file,
 # trimmed to the 24 h window, and if EVERY source for a file fails the previous file is left
 # untouched, so its generated_utc keeps showing its real age.
-_SAT_TO_SRC = {'N': 'VIIRS_SNPP_NRT', 'N20': 'VIIRS_NOAA20_NRT',
+_SAT_TO_SRC = {'N': 'VIIRS_SNPP_NRT', 'N20': 'VIIRS_NOAA20_NRT', 'N21': 'VIIRS_NOAA21_NRT',
                'A': 'MODIS_NRT', 'T': 'MODIS_NRT', 'Aqua': 'MODIS_NRT', 'Terra': 'MODIS_NRT'}
 
 
@@ -299,6 +301,8 @@ def main() -> int:
     # the silent "secret has trailing whitespace / is empty / never
     # propagated" failure mode that v1 of this pipeline hit on GHA.
     try:
+        if not MAP_KEY:
+            raise RuntimeError('no MAP_KEY (public-file fallback in use)')
         status_url = f'https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY={MAP_KEY}'
         with urllib.request.urlopen(status_url, timeout=15) as r:
             status_body = r.read().decode('utf-8', errors='replace')
@@ -307,11 +311,21 @@ def main() -> int:
         sys.stderr.write(f'[mapkey_status] probe failed (key_len={len(MAP_KEY)}): {e}\n')
 
     now_dt = datetime.now(timezone.utc)
+    global_rows = {}
+    min_lng, min_lat, max_lng, max_lat = US_FILTER
     for out_filename, sources in SOURCES.items():
         out_path = os.path.join('data', out_filename)
         prev = _previous(out_path)
-        rows, failed = build_output(out_filename, sources)
+        all_rows, failed = build_output(out_filename, sources)
         overall_failed.extend(failed)
+        # 2026-10-16 — keep the global set for global_out; the US files get the
+        # same envelope + hard cap they always had.
+        global_rows['modis' if out_filename == 'firms.json' else 'viirs'] = all_rows
+        rows = [d for d in all_rows if min_lat <= d['lat'] <= max_lat and min_lng <= d['lng'] <= max_lng]
+        cap = US_RECORD_HARD_CAP.get(out_filename, 100_000)
+        if len(rows) > cap:
+            sys.stderr.write(f'[cap] {out_filename}: {len(rows)} > {cap}, truncating\n')
+            rows = rows[:cap]
         if failed and len(failed) == len(sources) and prev:
             sys.stderr.write(f'[keep] {out_path}: every source failed this run; previous file left as is '
                              f'({prev.get("count")} rows from {prev.get("generated_utc")})\n')
@@ -359,6 +373,14 @@ def main() -> int:
             'detections': rows,
         })
         sys.stderr.write(f'[write] {out_path}: {len(rows)} rows\n')
+
+    # 2026-10-16 — global per-region outputs. Never allowed to break the US files above.
+    try:
+        global_out.write_global(global_rows, overall_failed,
+                                {'viirs': SOURCES['viirs.json'], 'modis': SOURCES['firms.json']},
+                                now_iso, DAYS * 24)
+    except Exception as _e:
+        sys.stderr.write(f'[global] write failed (US files unaffected): {_e}\n')
 
     # Watchdog: load existing health, increment consecutive_failures only
     # when ALL sources for a run failed. One source falling back is

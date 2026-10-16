@@ -46,6 +46,25 @@ jobs:
         with:
           python-version: '3.12'
 
+      # 2026-10-16 — the feed is global now (~300k detections/cycle). Without numpy +
+      # scikit-learn the deconflicter falls back to pure-Python brute force, which
+      # cannot keep up at that volume.
+      - name: install deps
+        run: python -m pip install --quiet numpy scikit-learn
+
+      # 2026-10-16 — restore the previous global files (from the single-commit `global`
+      # branch) so a source that times out this run carries its rows forward instead of
+      # vanishing. data/global/ is gitignored on main; the index is reset afterwards.
+      - name: restore previous global files
+        run: |
+          mkdir -p data/global
+          if git fetch --quiet --depth 1 origin global 2>/dev/null; then
+            git --work-tree=data/global checkout --quiet FETCH_HEAD -- . && git reset --quiet
+            echo "restored $(ls data/global | wc -l) global files"
+          else
+            echo "no global branch yet — first run"
+          fi
+
       - name: fetch FIRMS + VIIRS in a loop (4 cycles, ~3 min apart)
         env:
           FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
@@ -104,3 +123,19 @@ jobs:
             echo "::error::push failed after 4 attempts"
             exit 1
           fi
+
+      # 2026-10-16 — global per-region files go to the `global` branch as ONE commit with
+      # no parent, force-pushed every run: the client always reads the latest, and the
+      # repo never accumulates history for several MB of data every few minutes.
+      - name: publish global files (single-commit branch)
+        if: ${{ !cancelled() }}
+        run: |
+          if [ ! -f data/global/index.json ]; then echo "no global output this run"; exit 0; fi
+          export GIT_INDEX_FILE="$(mktemp)"
+          rm -f "$GIT_INDEX_FILE"
+          git --work-tree=data/global add -A .
+          tree=$(git write-tree)
+          commit=$(git -c user.name='github-actions[bot]' -c user.email='github-actions[bot]@users.noreply.github.com' \
+                   commit-tree "$tree" -m "global FIRMS $(date -u +%Y-%m-%dT%H:%MZ)")
+          git push --force --quiet origin "${commit}:refs/heads/global"
+          echo "published $(ls data/global | wc -l) files to branch global (${commit})"

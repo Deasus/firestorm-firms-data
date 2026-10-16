@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 .env
 *.tmp
+
+# 2026-10-16 — global per-region outputs are published to the single-commit `global`
+# branch by the workflow, never committed to main (several MB every few minutes).
+data/global/

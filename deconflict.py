@@ -40,7 +40,7 @@ import zipfile
 from typing import Optional
 
 # Public raw URLs — same pattern as firestorm-firms-data → firestorm-lightning-data etc.
-INDUSTRIAL_SITES_URL = 'https://raw.githubusercontent.com/Deasus/firestorm-industrial-sites/main/data/industrial_sites.min.geojson'
+INDUSTRIAL_SITES_URL = os.environ.get('CINDER_INDUSTRIAL_SITES_URL') or 'https://raw.githubusercontent.com/Deasus/firestorm-industrial-sites/main/data/industrial_sites.min.geojson'  # env override = local testing only
 LAND_POLY_URL        = 'https://raw.githubusercontent.com/Deasus/firestorm-industrial-sites/main/data/land_10m.geojson'
 
 # Meters conversion for haversine distances (Earth radius commonly cited)
@@ -249,6 +249,46 @@ class Deconflicter:
         # code deletion — just don't emit the flag.
 
         return out
+
+    def enrich_many(self, dets: list) -> None:
+        """Batched enrich() for the global feed (~300k detections per cycle).
+        Same rules as enrich(), but one vectorised BallTree query instead of one
+        numpy round-trip per detection (~30 s -> ~2 s). Updates dets in place.
+        Falls back to per-row enrich() if numpy/sklearn are missing."""
+        if not dets:
+            return
+        if self._tree is None or not (self.loaded and self.n_sources > 0):
+            for d in dets:
+                d.update(self.enrich(d))
+            return
+        import numpy as np
+        pts = np.radians(np.array([[d['lat'], d['lng']] for d in dets], dtype=float))
+        dist_rad, idx = self._tree.query(pts, k=1)
+        for d, dr, ix in zip(dets, dist_rad[:, 0], idx[:, 0]):
+            out = {'nearest_infra_m': None, 'nearest_infra_id': None, 'nearest_infra_class': None,
+                   'nearest_infra_name': None, 'deconfliction_flag': 'clear'}
+            conf_raw = d.get('confidence')
+            conf_str = str(conf_raw).strip().lower() if conf_raw is not None else ''
+            if conf_str in ('l', 'low') or (conf_str.isdigit() and int(conf_str) < 30):
+                out['deconfliction_flag'] = 'low_confidence'
+            props = self._props[int(ix)]
+            dist_m = float(dr) * EARTH_RADIUS_M
+            out['nearest_infra_m'] = int(dist_m)
+            out['nearest_infra_id'] = props.get('source_id')
+            out['nearest_infra_class'] = props.get('class')
+            out['nearest_infra_name'] = props.get('name')
+            buffer_m = props.get('buffer_m') or _default_buffer(props.get('class'))
+            if dist_m <= buffer_m and out['deconfliction_flag'] == 'clear':
+                cls = props.get('class')
+                if cls == 'volcano':
+                    out['deconfliction_flag'] = 'proximate_volcano'
+                elif cls == 'industrial':
+                    out['deconfliction_flag'] = 'proximate_industrial'
+                elif cls == 'solar':
+                    out['deconfliction_flag'] = 'proximate_solar'
+                else:
+                    out['deconfliction_flag'] = 'proximate_' + str(cls)
+            d.update(out)
 
     def _nearest(self, lat: float, lng: float) -> tuple[Optional[int], float]:
         """Return (index, distance_m) of the closest source."""
