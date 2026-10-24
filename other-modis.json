@@ -1,0 +1,1 @@
+{"generated_utc":"2026-10-24T16:16:23.291946Z","region":"other","sensor":"MODIS","window_hours":24,"fields":["lat","lng","frp","brightness_k","confidence","satellite","acq_date","acq_time","daynight","deconfliction_flag","nearest_infra_m","nearest_infra_class","nearest_infra_name"],"count":0,"carried_forward_rows":0,"deconfliction_counts":{},"rows":[]}
